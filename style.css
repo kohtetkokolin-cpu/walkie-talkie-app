@@ -187,8 +187,8 @@
     min-height:0;
     overflow:hidden;
   }
-  #panelA{background:var(--panelA); border-bottom:2px solid var(--border); transform:rotate(180deg);}
-  #panelB{background:var(--panelB);}
+  #panelA{background:var(--panelA); border-bottom:2px solid var(--border); transform:rotate(180deg); display:none;}
+  #panelB{background:var(--panelB); display:none;}
 
   .panel-header{
     padding:8px 16px;
@@ -466,7 +466,7 @@
   /* ===== Divider ===== */
   #divider{
     height:2px;background:rgba(255,255,255,0.12);
-    position:relative; flex-shrink:0; z-index:10;
+    position:relative; flex-shrink:0; z-index:10; display:none;
   }
   #dividerBadge{
     position:absolute; top:-14px; left:50%; transform:translateX(-50%);

@@ -3,7 +3,7 @@
 // of serving stale ones from cache. app.js already calls reg.update() on
 // every launch and reloads once a new SW takes over, so bumping this is
 // the only step needed to ship an update.
-const CACHE_VERSION = 'wt-shell-v1';
+const CACHE_VERSION = 'wt-shell-v2';
 
 // Only the app shell is cached. API calls (Gemini, any Secure Proxy URL)
 // are deliberately NEVER cached — translations must always be live, and

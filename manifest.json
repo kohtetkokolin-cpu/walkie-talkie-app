@@ -1,16 +1,27 @@
 {
-  "name": "Walkie Talkie Translator",
+  "name": "Walkie-Talkie Translator",
   "short_name": "Translator",
+  "description": "Face-to-face voice & text translator for migrant workers — works offline for common phrases.",
   "start_url": "./index.html",
+  "scope": "./",
   "display": "standalone",
+  "orientation": "portrait",
   "background_color": "#090A0F",
   "theme_color": "#090A0F",
+  "lang": "my",
+  "dir": "ltr",
   "icons": [
     {
       "src": "icon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "purpose": "any"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
     }
   ]
 }

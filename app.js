@@ -171,6 +171,28 @@ function pickVoice(localeCode){
   return v || null;
 }
 
+// Lets the person directly see (in Settings → Voice) whether the phone has
+// found a usable Myanmar voice — instead of guessing why audio does or
+// doesn't cost an API call.
+function updateVoiceDiag(){
+  const el = document.getElementById('voiceDiag');
+  if(!el) return;
+  const myLang = langByCode('my') || { ttsLocale: 'my-MM' };
+  const v = pickVoice(myLang.ttsLocale);
+  el.textContent = v
+    ? `✅ ဖုန်းမှာ မြန်မာ voice တွေ့ပါတယ် ("${v.name}") — Auto/Device mode မှာ API မကုန်ဘဲ အသံထွက်ပါလိမ့်မယ်`
+    : '⚠️ ဖုန်းမှာ မြန်မာ voice မတွေ့သေးပါ — Settings → System → Text-to-speech output မှာ preferred engine ကို SM Myanmar TTS ပြောင်းထားလား စစ်ကြည့်ပါ';
+}
+
+document.getElementById('testVoiceBtn')?.addEventListener('click', () => {
+  const myLang = langByCode('my') || { ttsLocale: 'my-MM', name: 'Myanmar' };
+  const sample = 'မင်္ဂလာပါ၊ ဒါက အသံစမ်းသပ်ချက်ပါ';
+  const engine = state.voiceEngine || 'auto';
+  const willUseDevice = engine === 'device' || (engine === 'auto' && pickVoice(myLang.ttsLocale));
+  showToast(willUseDevice ? '📱 Device voice ကို စမ်းနေပါတယ်...' : '🤖 AI voice ကို စမ်းနေပါတယ် (API 1 ကြိမ်သုံးပါမယ်)...', 'info');
+  speak(sample, myLang);
+});
+
 function startStt(side){
   if(!recognition){
     showToast('ဒီ browser မှာ voice recognition ကို support မလုပ်ပါ။ Chrome browser သုံးကြည့်ပါ။', 'error');
@@ -499,7 +521,69 @@ function pickAudioMimeType(){
   return '';
 }
 
-async function startHoldRecording(side){
+// ---- Conversation screen (A/B) Hold-to-Talk: free, on-device transcription ----
+// The language spoken on each side is already known (state.langA/state.langB),
+// so there's no need to send audio to Gemini just to figure out what was
+// said — the same free SpeechRecognition engine the tap-mic button already
+// uses can transcribe it, and only the resulting TEXT (much cheaper, and
+// reuses the existing cache/streaming/throttle path) goes to the API.
+function startHoldRecording(side){
+  if(side === 'QT') return startHoldRecordingAudio(side);
+  if(!SpeechRec){
+    showToast('ဒီ browser မှာ voice recognition ကို support မလုပ်ပါ။ Chrome ကို သုံးကြည့်ပါ။', 'error');
+    return;
+  }
+  if('speechSynthesis' in window) window.speechSynthesis.cancel();
+  const lang = side === 'A' ? state.langA : state.langB;
+  try{
+    const rec = new SpeechRec();
+    rec.lang = lang.ttsLocale;
+    rec.continuous = true;
+    rec.interimResults = true;
+    let finalText = '';
+    rec.onresult = (e) => {
+      let interim = '';
+      for(let i = e.resultIndex; i < e.results.length; i++){
+        if(e.results[i].isFinal) finalText += e.results[i][0].transcript + ' ';
+        else interim += e.results[i][0].transcript;
+      }
+      updateHoldCaption(side, (finalText + interim).trim() || '🎙️ Listening...');
+    };
+    rec.onerror = (e) => {
+      if(e.error === 'not-allowed' || e.error === 'permission-denied'){
+        showToast('Microphone ခွင့်ပြုချက် လိုအပ်ပါတယ်။ Browser setting ထဲမှာ mic ခွင့်ပြုပေးပါ။', 'error');
+      }
+    };
+    holdRecordingState[side] = { rec, getFinalText: () => finalText.trim() };
+    rec.start();
+    startWaveform(side); // separate mic access purely for the visual bars; harmless in parallel
+  }catch(e){
+    console.error('Hold-to-Talk speech recognition failed to start:', e);
+    showToast('Microphone ခွင့်ပြုချက် လိုအပ်ပါတယ်။', 'error');
+    clearHoldCaption(side);
+  }
+}
+
+function stopHoldRecording(side){
+  if(side === 'QT') return stopHoldRecordingAudio(side);
+  const r = holdRecordingState[side];
+  if(!r){ clearHoldCaption(side); return; }
+  updateHoldCaption(side, '⏳ Processing...');
+  const finish = () => {
+    const text = r.getFinalText();
+    delete holdRecordingState[side];
+    clearHoldCaption(side);
+    if(text) handleTranslation(text, side, true);
+  };
+  r.rec.onend = finish;
+  try{ r.rec.stop(); }catch(e){ finish(); }
+}
+
+// ---- Quick Translate Hold-to-Talk: Gemini audio (needs language auto-detect) ----
+// QT doesn't know what language you're about to speak, and SpeechRecognition
+// has no reliable auto-detect — only sending the audio to Gemini can figure
+// out the language AND transcribe it in one pass. This path is unchanged.
+async function startHoldRecordingAudio(side){
   if(!window.MediaRecorder){
     showToast('ဒီ browser မှာ voice recording ကို support မလုပ်ပါ။ Chrome ကို သုံးကြည့်ပါ။', 'error');
     return;
@@ -520,7 +604,7 @@ async function startHoldRecording(side){
   }
 }
 
-function stopHoldRecording(side){
+function stopHoldRecordingAudio(side){
   const r = holdRecordingState[side];
   if(!r){ clearHoldCaption(side); return; }
   updateHoldCaption(side, '⏳ Processing...');
@@ -1795,6 +1879,7 @@ document.getElementById('settingsBtn').addEventListener('click', ()=>{
   document.querySelectorAll('#voiceEngineRow .speedBtn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.engine === state.voiceEngine);
   });
+  updateVoiceDiag();
   overlay.classList.add('show');
 });
 document.querySelectorAll('#backendModeRow .speedBtn').forEach(btn => {

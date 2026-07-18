@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.18-r2';
+const APP_VERSION = '2026.07.18-r3';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');
@@ -138,6 +138,8 @@ const state = {
   backendMode: 'key',
   proxyUrl: '',
 };
+
+function otherSide(side){ return side === 'A' ? 'B' : 'A'; }
 
 /**
  * Gboard-style "voice typing" for a text field: tapping the mic dictates

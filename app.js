@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.18-r1';
+const APP_VERSION = '2026.07.18-r2';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');
@@ -139,7 +139,60 @@ const state = {
   proxyUrl: '',
 };
 
-function otherSide(side){ return side === 'A' ? 'B' : 'A'; }
+/**
+ * Gboard-style "voice typing" for a text field: tapping the mic dictates
+ * INTO the box (live, word-by-word) instead of immediately translating —
+ * the person can review and edit before pressing Send. This is separate
+ * from the tap-mic/Hold-to-Talk buttons, which translate right away; this
+ * one is for when accuracy matters enough to want a last look first.
+ * Free — same on-device SpeechRecognition as the rest of the app.
+ */
+function attachDictation(inputEl, micBtnEl, getLang){
+  if(!SpeechRec){ micBtnEl.style.display = 'none'; return; }
+  let rec = null;
+  let listening = false;
+  let baseValue = '';
+  let finalText = '';
+
+  micBtnEl.addEventListener('click', () => {
+    if(listening){ try{ rec.stop(); }catch(e){} return; }
+    if('speechSynthesis' in window) window.speechSynthesis.cancel();
+    const lang = getLang();
+    try{
+      rec = new SpeechRec();
+      rec.lang = lang.ttsLocale;
+      rec.continuous = true;
+      rec.interimResults = true;
+      baseValue = inputEl.value ? inputEl.value.trim() + ' ' : '';
+      finalText = '';
+      listening = true;
+      micBtnEl.classList.add('dictating');
+      rec.onresult = (e) => {
+        let interim = '';
+        for(let i = e.resultIndex; i < e.results.length; i++){
+          if(e.results[i].isFinal) finalText += e.results[i][0].transcript + ' ';
+          else interim += e.results[i][0].transcript;
+        }
+        inputEl.value = (baseValue + finalText + interim).trim();
+      };
+      rec.onerror = (e) => {
+        if(e.error === 'not-allowed' || e.error === 'permission-denied'){
+          showToast('Microphone ခွင့်ပြုချက် လိုအပ်ပါတယ်။', 'error');
+        }
+      };
+      rec.onend = () => {
+        listening = false;
+        micBtnEl.classList.remove('dictating');
+      };
+      rec.start();
+    }catch(e){
+      listening = false;
+      micBtnEl.classList.remove('dictating');
+    }
+  });
+}
+
+
 
 /* =========================================================
    SPEECH: STT + TTS (Web Speech API)
@@ -1468,6 +1521,7 @@ function renderPanel(side){
 
       <div class="textFieldWrap" id="textFieldWrap${side}" style="${state.pttMode[side]?'display:none;':''}">
         <input type="text" id="input${side}" maxlength="4000" placeholder="Type message to translate..." aria-label="Message to translate" ${isA ? 'readonly' : ''}>
+        ${isA ? '' : `<button type="button" class="dictateBtn" id="dictate${side}" title="Voice typing" aria-label="Dictate text">${svgMic()}</button>`}
         <button class="sendBtn" id="sendBtn${side}" aria-label="Send and translate">${svgSend()}</button>
       </div>
 
@@ -1505,6 +1559,9 @@ function renderPanel(side){
   document.getElementById('input'+side).addEventListener('keydown', (e)=>{
     if(e.key === 'Enter') handleTranslation(e.target.value, side, false);
   });
+  if(!isA){
+    attachDictation(document.getElementById('input'+side), document.getElementById('dictate'+side), () => (isA ? state.langA : state.langB));
+  }
   if(isA){
     document.getElementById('inputA').addEventListener('click', ()=>{
       openTypeOverlay('A');
@@ -2338,6 +2395,7 @@ document.getElementById('qtInput').addEventListener('input', (e) => {
   e.target.style.height = 'auto';
   e.target.style.height = Math.min(e.target.scrollHeight, 110) + 'px';
 });
+attachDictation(document.getElementById('qtInput'), document.getElementById('qtDictateBtn'), () => state.langB);
 document.getElementById('qtInput').addEventListener('keydown', (e) => {
   if(e.key === 'Enter' && !e.shiftKey){
     e.preventDefault();
@@ -2690,6 +2748,11 @@ document.getElementById('typeOverlayInput').addEventListener('keydown', (e)=>{
     document.getElementById('typeOverlaySendBtn').click();
   }
 });
+attachDictation(
+  document.getElementById('typeOverlayInput'),
+  document.getElementById('typeOverlayDictateBtn'),
+  () => (typeOverlaySide === 'A' ? state.langA : state.langB)
+);
 
 qtPopulateSelects();
 qtRenderHistory();

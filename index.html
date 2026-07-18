@@ -139,6 +139,9 @@
     </button>
     <div class="textFieldWrap" id="qtTextFieldWrap" style="flex:1;">
       <textarea id="qtInput" rows="1" maxlength="4000" placeholder="မသိတဲ့ စာသားကို ကူး/ရိုက်ထည့်ပါ..."></textarea>
+      <button type="button" class="dictateBtn" id="qtDictateBtn" title="Voice typing" aria-label="Dictate text">
+        <svg viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 12z"/></svg>
+      </button>
       <button id="qtSendBtn" class="sendBtn" aria-label="Translate this text">
         <svg viewBox="0 0 24 24"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
       </button>
@@ -180,6 +183,7 @@
       </button>
     </div>
     <textarea id="typeOverlayInput" placeholder="Type message to translate..." rows="3" maxlength="4000"></textarea>
+    <button type="button" id="typeOverlayDictateBtn" class="btnGhost" style="width:100%;padding:9px;border:1px solid var(--border2);border-radius:10px;margin:8px 0;font-size:12px;display:flex;align-items:center;justify-content:center;gap:6px;">🎙️ Voice Typing</button>
     <button id="typeOverlaySendBtn" class="obBtn">➤ Send &amp; Translate</button>
   </div>
 </div>

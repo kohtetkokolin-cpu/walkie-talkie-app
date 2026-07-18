@@ -423,6 +423,14 @@
   }
   .sendBtn svg{width:17px;height:17px;fill:var(--cyan);}
 
+  .dictateBtn{
+    background:none;border:none;cursor:pointer;padding:8px;display:flex;flex-shrink:0;
+    touch-action:manipulation;
+  }
+  .dictateBtn svg{width:17px;height:17px;fill:#aaa;transition:fill .15s;}
+  .dictateBtn.dictating{animation:autopulse 1s infinite;}
+  .dictateBtn.dictating svg{fill:var(--red);}
+
   .camBtn{
     width:42px;height:42px;border-radius:50%;flex-shrink:0;
     background:rgba(255,255,255,0.08);

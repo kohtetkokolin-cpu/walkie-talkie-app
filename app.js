@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.16-live';
+const APP_VERSION = '2026.07.18-r1';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');

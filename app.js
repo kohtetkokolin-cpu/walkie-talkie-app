@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.18-r3';
+const APP_VERSION = '2026.07.18-r4';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');
@@ -19,6 +19,16 @@ function showToast(message, type){
     el.classList.add('fadeOut');
     setTimeout(() => el.remove(), 300);
   }, 4200);
+}
+
+// Turns a raw HTTP status (+ optionally the response body, only used for
+// console logging by the caller) into a short, friendly Burmese message.
+// The raw JSON never reaches the chat bubble — only this classification does.
+function friendlyApiError(status){
+  if(status === 429) return '⏳ AI quota ကုန်သွားပါပြီ (daily limit) — offline dictionary နဲ့ ပြန်ပြထားပါတယ်';
+  if(status === 401 || status === 403) return '🔑 API key မှားနေနိုင်ပါတယ် — Settings → Account မှာ key ပြန်စစ်ပေးပါ';
+  if(status >= 500) return '☁️ Google AI server ခဏပြဿနာ ရှိနေပါတယ် — ခဏနေ ထပ်စမ်းကြည့်ပါ';
+  return '⚠️ AI ဆက်သွယ်လို့ မရပါ — offline dictionary နဲ့ ပြန်ပြထားပါတယ်';
 }
 
 
@@ -133,7 +143,6 @@ const state = {
   glossary: '',
   saveHistory: false,
   voiceEngine: 'auto',
-  pttMode: {A: false, B: false},
   currentView: 'home',
   backendMode: 'key',
   proxyUrl: '',
@@ -309,14 +318,14 @@ function stopSttManual(){
 }
 
 /* =========================================================
-   HOLD-TO-TALK via MediaRecorder + Gemini audio input.
-   Web Speech API's "continuous" mode is well known to be unreliable on
-   Android Chrome (sessions end unexpectedly, results get lost). Instead,
-   Hold-to-Talk just records the raw audio for however long the button is
-   held (like a WeChat voice message), then sends that audio straight to
-   Gemini on release — Gemini transcribes AND translates it in one call.
-   This is far more robust: it doesn't depend on the browser's flaky
-   speech-recognition engine at all for the actual translation result.
+   HOLD-TO-TALK (Conversation screen, A/B)
+   Hold the mic → free on-device SpeechRecognition transcribes live,
+   writing straight into the visible text field as you speak (Gboard-style)
+   → release → whatever's in the field is sent immediately. The language
+   for each side is already known (state.langA/state.langB), so there's no
+   need to send audio to Gemini just to figure out what was said.
+   Quick Translate's Hold-to-Talk is different (see startHoldRecordingAudio
+   below) because it doesn't know the source language in advance.
 ========================================================= */
 const holdRecordingState = {}; // side -> { stream, mediaRecorder, chunks, mimeType }
 
@@ -590,6 +599,7 @@ function startHoldRecording(side){
   }
   if('speechSynthesis' in window) window.speechSynthesis.cancel();
   const lang = side === 'A' ? state.langA : state.langB;
+  const inputEl = document.getElementById('input'+side);
   try{
     const rec = new SpeechRec();
     rec.lang = lang.ttsLocale;
@@ -602,7 +612,7 @@ function startHoldRecording(side){
         if(e.results[i].isFinal) finalText += e.results[i][0].transcript + ' ';
         else interim += e.results[i][0].transcript;
       }
-      updateHoldCaption(side, (finalText + interim).trim() || '🎙️ Listening...');
+      if(inputEl) inputEl.value = (finalText + interim).trim();
     };
     rec.onerror = (e) => {
       if(e.error === 'not-allowed' || e.error === 'permission-denied'){
@@ -611,23 +621,21 @@ function startHoldRecording(side){
     };
     holdRecordingState[side] = { rec, getFinalText: () => finalText.trim() };
     rec.start();
-    startWaveform(side); // separate mic access purely for the visual bars; harmless in parallel
   }catch(e){
     console.error('Hold-to-Talk speech recognition failed to start:', e);
     showToast('Microphone ခွင့်ပြုချက် လိုအပ်ပါတယ်။', 'error');
-    clearHoldCaption(side);
   }
 }
 
 function stopHoldRecording(side){
   if(side === 'QT') return stopHoldRecordingAudio(side);
   const r = holdRecordingState[side];
-  if(!r){ clearHoldCaption(side); return; }
-  updateHoldCaption(side, '⏳ Processing...');
+  if(!r) return;
   const finish = () => {
     const text = r.getFinalText();
     delete holdRecordingState[side];
-    clearHoldCaption(side);
+    // handleTranslation re-renders the panel (which naturally clears the
+    // input), so nothing left over to wipe manually here.
     if(text) handleTranslation(text, side, true);
   };
   r.rec.onend = finish;
@@ -673,7 +681,6 @@ function stopHoldRecordingAudio(side){
       return;
     }
     if(side === 'QT') qtHandleVoiceHold(blob);
-    else handleVoiceHold(side, blob);
   };
 
   if(r.mediaRecorder.state === 'inactive'){
@@ -684,115 +691,6 @@ function stopHoldRecordingAudio(side){
   try{ r.mediaRecorder.stop(); }catch(e){ finish(new Blob(r.chunks, { type: r.mimeType })); }
 }
 
-async function handleVoiceHold(side, blob){
-  if(state.offlineForced || !hasBackend()){
-    showToast('Hold-to-Talk အတွက် AI Translation Key/Internet လိုအပ်ပါတယ်', 'warn');
-    clearHoldCaption(side);
-    return;
-  }
-  const sourceLang = side === 'A' ? state.langA : state.langB;
-  const targetLang = side === 'A' ? state.langB : state.langA;
-  state.translating[side] = true;
-
-  const msgId = Date.now().toString();
-  state.messages.unshift({
-    id: msgId, sender: side, originalText: '(transcribing voice…)', translatedText: '',
-    isVoice: true, approx: false, usedOffline: false, pending: true, timestamp: Date.now(),
-  });
-  renderPanel('A'); renderPanel('B');
-  clearHoldCaption(side);
-
-  try{
-    const base64 = await fileToBase64(blob);
-    const prompt = `Listen to this audio clip — someone speaking in ${sourceLang.name} (it could be a different language, detect it). `
-      + `Step 1: Transcribe exactly what they said. `
-      + `Step 2: Translate it into natural, fluent, native-sounding ${targetLang.name} — the full meaning and intent the way a native speaker would actually say it, NOT word-for-word. `
-      + `Tone: ${toneInstruction()} `
-      + `${glossaryInstruction()}`
-      + `${conversationContextBlock()}`
-      + `Respond in EXACTLY this format with no extra commentary:\n`
-      + `ORIGINAL: <exact transcription of what was said>\n`
-      + `TRANSLATED: <the natural translation into ${targetLang.name}>`;
-
-    let holdStreamStructureReady = false;
-    const streamResult = await geminiFetchStream('gemini-3.5-flash', {
-      contents: [{ parts: [
-        { text: prompt },
-        { inline_data: { mime_type: blob.type || 'audio/webm', data: base64 } }
-      ] }],
-      generationConfig: { temperature: 0.3, maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: 'minimal' } }
-    }, (partialRaw) => {
-      const liveMsg = state.messages.find(m => m.id === msgId);
-      if(!liveMsg) return;
-      const origMatch = partialRaw.match(/ORIGINAL:\s*([\s\S]*?)(\nTRANSLATED:|$)/i);
-      const transMatch = partialRaw.match(/TRANSLATED:\s*([\s\S]*)/i);
-      if(origMatch) liveMsg.originalText = origMatch[1].trim() || '(transcribing voice…)';
-      if(transMatch) liveMsg.translatedText = transMatch[1].trim();
-      liveMsg.pending = false;
-      if(!holdStreamStructureReady){
-        holdStreamStructureReady = true;
-        renderPanel('A'); renderPanel('B');
-      } else {
-        patchStreamingFields(msgId, { orig: liveMsg.originalText, trans: liveMsg.translatedText });
-      }
-    });
-
-    const msg = state.messages.find(m => m.id === msgId);
-    if(!streamResult.ok){
-      let bodyText = ''; try{ bodyText = streamResult.resp ? await streamResult.resp.text() : ''; }catch(e2){}
-      console.error('Voice hold API error:', streamResult.status, bodyText);
-      if(msg){
-        msg.originalText = '(voice message)';
-        msg.translatedText = `[Error] Could not process voice`;
-        msg.errorDetail = `API Error ${streamResult.status || ''}`;
-        msg.pending = false;
-      }
-      state.translating[side] = false;
-      renderPanel('A'); renderPanel('B');
-      return;
-    }
-
-    const raw = streamResult.fullText || '';
-    const origMatch = raw.match(/ORIGINAL:\s*([\s\S]*?)\nTRANSLATED:/i);
-    const transMatch = raw.match(/TRANSLATED:\s*([\s\S]*)/i);
-    const originalText = origMatch ? origMatch[1].trim() : '(voice message)';
-    const translatedText = transMatch ? transMatch[1].trim() : raw;
-
-    if(msg){
-      msg.originalText = originalText;
-      msg.translatedText = translatedText;
-      msg.pending = false;
-    }
-    if(originalText && translatedText) tmSave(sourceLang.code, targetLang.code, originalText, translatedText);
-
-    state.translating[side] = false;
-    renderPanel('A'); renderPanel('B');
-    vibrate(15);
-
-    const continueAutoConversation = () => {
-      if(state.autoConversation){
-        const replySide = otherSide(side);
-        if(!state.listening.A && !state.listening.B && !state.translating.A && !state.translating.B){
-          setTimeout(() => { if(state.autoConversation) startStt(replySide); }, 350);
-        }
-      }
-    };
-    if(state.autoSpeak) speak(translatedText, targetLang, continueAutoConversation);
-    else continueAutoConversation();
-
-  }catch(e){
-    console.error('handleVoiceHold failed:', e);
-    const msg = state.messages.find(m => m.id === msgId);
-    if(msg){
-      msg.originalText = '(voice message)';
-      msg.translatedText = `[Error] ${e.message}`;
-      msg.errorDetail = `Connection error: ${e.message}`;
-      msg.pending = false;
-    }
-    state.translating[side] = false;
-    renderPanel('A'); renderPanel('B');
-  }
-}
 
 /* =========================================================
    WAVEFORM — real-time mic level visualization for Hold-to-Talk.
@@ -1290,19 +1188,19 @@ async function handleTranslation(rawText, sender, isVoice){
           tmSave(sourceLang.code, targetLang.code, rawText, translated);
         }
         else {
-          errorDetail = `Empty response (finishReason: ${streamResult.finishReason || 'unknown'})`;
+          errorDetail = 'AI ကနေ အဖြေ မရနိုင်ပါ — offline dictionary နဲ့ ပြန်ပြထားပါတယ်';
           console.error('Gemini empty response for streamed request');
           await fallbackOffline('[Empty response]');
         }
       } else {
         let bodyText = '';
         try{ bodyText = streamResult.resp ? await streamResult.resp.text() : ''; }catch(e2){}
-        errorDetail = `API Error ${streamResult.status || ''}: ${bodyText.slice(0, 200)}`;
+        errorDetail = friendlyApiError(streamResult.status);
         console.error('Gemini API error:', streamResult.status, bodyText);
         await fallbackOffline('[Network Error]');
       }
     } catch(e){
-      errorDetail = `Connection error: ${e.message} — VPN/firewall ရှိရင် ပိတ်ကြည့်ပါ, Wi-Fi/mobile data ပြောင်းကြည့်ပါ`;
+      errorDetail = 'Internet connection မရပါ — Wi-Fi/mobile data စစ်ကြည့်ပါ';
       console.error('Gemini fetch failed:', e);
       await fallbackOffline('[Error Connection]');
     }
@@ -1515,34 +1413,19 @@ function renderPanel(side){
       </select>
     </div>
     <div class="chatLog" id="chatLog${side}"></div>
-    <div class="pttCaption" id="pttCaption${side}"></div>
     <div class="inputRow">
-      <button class="modeToggleBtn ${state.pttMode[side]?'active':''}" id="modeToggle${side}" title="Switch between typing and Hold-to-Talk" aria-label="Switch input mode">
-        ${state.pttMode[side] ? svgKeyboard() : svgWalkieTalkie()}
-      </button>
-
-      <div class="textFieldWrap" id="textFieldWrap${side}" style="${state.pttMode[side]?'display:none;':''}">
-        <input type="text" id="input${side}" maxlength="4000" placeholder="Type message to translate..." aria-label="Message to translate" ${isA ? 'readonly' : ''}>
-        ${isA ? '' : `<button type="button" class="dictateBtn" id="dictate${side}" title="Voice typing" aria-label="Dictate text">${svgMic()}</button>`}
+      <div class="textFieldWrap" id="textFieldWrap${side}">
+        <input type="text" id="input${side}" maxlength="4000" placeholder="${isA ? 'Hold mic to talk…' : 'Type or hold mic to talk…'}" aria-label="Message to translate" ${isA ? 'readonly' : ''}>
         <button class="sendBtn" id="sendBtn${side}" aria-label="Send and translate">${svgSend()}</button>
       </div>
-
-      <div class="pttWrap" id="pttWrap${side}" style="${state.pttMode[side]?'':'display:none;'}">
-        <div class="waveformBox" id="waveform${side}">
-          ${Array.from({length:9}).map(()=>'<div class="wfBar idle" style="height:6px;"></div>').join('')}
-        </div>
-        <button class="pttCircle ${isListening?'recording':''}" id="pttCircle${side}" aria-label="Hold to talk">
-          ${svgMic()}
-        </button>
-      </div>
+      <button class="holdMicBtn ${isListening?'recording':''}" id="holdMic${side}" aria-label="Hold to talk, release to send">
+        ${svgMic()}
+      </button>
     </div>
     <div class="toolbarRow">
       <button class="camBtn ${isTranslating?'busy':''}" id="cam${side}" title="Scan photo, PDF, or file to translate" aria-label="Scan a photo, PDF, or file to translate">${svgCamera()}</button>
       <button class="camBtn" id="phrasebook${side}" title="Quick phrasebook — emergency, medical, work, housing" aria-label="Open quick phrasebook">${svgBook()}</button>
-      <button class="camBtn ${isListening&&!state.pttMode[side]?'listening '+side:''} ${isTranslating?'busy':''}" id="mic${side}" title="Tap to talk, auto-stops when you pause" aria-label="Speak to translate (tap mode)">
-        ${isTranslating ? '<div class="spinner" style="width:16px;height:16px;"></div>' : svgMic()}
-      </button>
-      <div class="pttHint" style="flex:1;text-align:right;padding-right:2px;">${state.pttMode[side] ? '🎙️ Hold circle to talk' : ''}</div>
+      <div class="pttHint" style="flex:1;text-align:right;padding-right:2px;">🎙️ Hold mic to talk, release to send</div>
     </div>
   `;
 
@@ -1561,56 +1444,36 @@ function renderPanel(side){
   document.getElementById('input'+side).addEventListener('keydown', (e)=>{
     if(e.key === 'Enter') handleTranslation(e.target.value, side, false);
   });
-  if(!isA){
-    attachDictation(document.getElementById('input'+side), document.getElementById('dictate'+side), () => (isA ? state.langA : state.langB));
-  }
   if(isA){
     document.getElementById('inputA').addEventListener('click', ()=>{
       openTypeOverlay('A');
     });
   }
 
-  const micBtn = document.getElementById('mic'+side);
-  micBtn.addEventListener('click', (e)=>{
-    e.preventDefault();
-    if(isTranslating) return;
-    if(state.listening[side]){ stopSttManual(); }
-    else { vibrate(10); startStt(side); }
-  });
-
-  document.getElementById('modeToggle'+side).addEventListener('click', ()=>{
-    if(state.listening[side]) stopSttManual();
-    state.pttMode[side] = !state.pttMode[side];
-    vibrate(10);
-    renderPanel(side);
-  });
-
-  const pttCircle = document.getElementById('pttCircle'+side);
-  let pttHoldActive = false;
-  pttCircle.addEventListener('pointerdown', (e)=>{
+  const holdMic = document.getElementById('holdMic'+side);
+  let holdActive = false;
+  holdMic.addEventListener('pointerdown', (e)=>{
     e.preventDefault();
     if(isTranslating) return;
     // Pointer capture keeps pointerup targeting this button even if the
     // finger drifts slightly during the hold — without this, mobile touch
     // tracking can misfire "pointerleave" almost instantly and cut off
     // the recording before any speech is captured.
-    try{ pttCircle.setPointerCapture(e.pointerId); }catch(err){}
-    pttHoldActive = true;
+    try{ holdMic.setPointerCapture(e.pointerId); }catch(err){}
+    holdActive = true;
     vibrate(15);
-    pttCircle.classList.add('recording');
-    updateHoldCaption(side, '🎙️ Recording... release to send');
+    holdMic.classList.add('recording');
     startHoldRecording(side);
   });
-  const endPttHold = ()=>{
-    if(!pttHoldActive) return;
-    pttHoldActive = false;
+  const endHold = ()=>{
+    if(!holdActive) return;
+    holdActive = false;
     vibrate(10);
-    pttCircle.classList.remove('recording');
-    stopWaveform(side);
+    holdMic.classList.remove('recording');
     stopHoldRecording(side);
   };
-  pttCircle.addEventListener('pointerup', endPttHold);
-  pttCircle.addEventListener('pointercancel', endPttHold);
+  holdMic.addEventListener('pointerup', endHold);
+  holdMic.addEventListener('pointercancel', endHold);
 
   const camBtn = document.getElementById('cam'+side);
   camBtn.addEventListener('click', (e)=>{
@@ -2458,378 +2321,4 @@ async function qtHandleVoiceHold(blob){
       if(wasPending){
         qtRenderHistory();
       } else {
-        if(origMatch) patchQtStreamingOrig(id, liveItem.originalText);
-        if(transMatch) patchQtStreamingText(id, liveItem.translatedText);
-      }
-    });
-
-    if(!streamResult.ok){
-      let bodyText = ''; try{ bodyText = streamResult.resp ? await streamResult.resp.text() : ''; }catch(e2){}
-      console.error('QT voice hold API error:', streamResult.status, bodyText);
-      showToast(`Voice translation မအောင်မြင်ပါ (Error ${streamResult.status || ''})`, 'error');
-      state.qtHistory = state.qtHistory.filter(i => i.id !== id);
-      qtRenderHistory();
-      return;
-    }
-
-    const raw = streamResult.fullText || '';
-    const langMatch = raw.match(/LANG:\s*(.*)/i);
-    const origMatch = raw.match(/ORIGINAL:\s*([\s\S]*?)\nTRANSLATION:/i);
-    const transMatch = raw.match(/TRANSLATION:\s*([\s\S]*)/i);
-    const detectedLang = langMatch ? langMatch[1].trim() : '';
-    const originalText = origMatch ? origMatch[1].trim() : '(voice message)';
-    const translatedText = transMatch ? transMatch[1].trim() : raw;
-
-    const item = state.qtHistory.find(i => i.id === id);
-    if(item){
-      Object.assign(item, { pending: false, originalText, translatedText, detectedLang, usedOffline: false, approx: false });
-    }
-    if(originalText) tmSave('auto', targetLang.code, originalText, translatedText);
-    qtRenderHistory();
-    vibrate(15);
-    if(state.autoSpeak) speak(translatedText, targetLang);
-  }catch(e){
-    console.error('qtHandleVoiceHold failed:', e);
-    showToast(`Voice translation အမှားဖြစ်သွားပါတယ်: ${e.message}`, 'error');
-    state.qtHistory = state.qtHistory.filter(i => i.id !== id);
-    qtRenderHistory();
-  }
-}
-
-async function qtScanAndTranslate(file){
-  const targetLang = langByCode(state.qtTargetCode) || LANGUAGES[0];
-  if(state.offlineForced || !hasBackend()){
-    showToast('Scan feature အတွက် AI Translation Key လိုအပ်ပါတယ်။ Settings ထဲမှာ ထည့်ပေးပါ။', 'warn');
-    return;
-  }
-  const id = Date.now().toString();
-  state.qtHistory.unshift({ id, pending: true, queryLabel: '(scanning photo…)' });
-  qtRenderHistory();
-
-  try{
-    const base64 = await fileToBase64(file);
-    const isImage = file.type && file.type.startsWith('image/');
-    const photoUrl = isImage ? `data:${file.type};base64,${base64}` : null;
-    const domainHint = domainByCode(state.qtDomain).hint;
-    const prompt = `Read all the text in this file (a photo or PDF document, any language; if multi-page PDF, read all pages). Detect its language, then translate it into ${targetLang.name}, `
-      + `understanding the full meaning naturally rather than word-for-word.\n\n`
-      + `Tone: ${toneInstruction()}\n`
-      + `${glossaryInstruction()}`
-      + (domainHint ? `\nWork context: ${domainHint}\n` : '')
-      + `\nRespond in EXACTLY this format, nothing else:\n`
-      + `LANG: <name of the detected source language>\n`
-      + `ORIGINAL: <the text you read>\n`
-      + `TRANSLATION: <the natural translation into ${targetLang.name}>`;
-
-    const resp = await geminiFetch('gemini-3.5-flash', {
-      contents: [{ parts: [
-        { text: prompt },
-        { inline_data: { mime_type: file.type || 'image/jpeg', data: base64 } }
-      ] }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 2048,
-        thinkingConfig: { thinkingLevel: 'minimal' },
-        mediaResolution: 'MEDIA_RESOLUTION_MEDIUM'
-      }
-    });
-
-    if(!resp.ok){
-      let bodyText = ''; try{ bodyText = await resp.text(); }catch(e2){}
-      console.error('QT scan API error:', resp.status, bodyText);
-      showToast(`Scan translation မအောင်မြင်ပါ (Error ${resp.status})`, 'error');
-      state.qtHistory = state.qtHistory.filter(i => i.id !== id);
-      qtRenderHistory();
-      return;
-    }
-
-    const data = await resp.json();
-    const raw = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
-    const langMatch = raw.match(/LANG:\s*(.*)/i);
-    const origMatch = raw.match(/ORIGINAL:\s*([\s\S]*?)\nTRANSLATION:/i);
-    const transMatch = raw.match(/TRANSLATION:\s*([\s\S]*)/i);
-    const detectedLang = langMatch ? langMatch[1].trim() : '';
-    const originalText = origMatch ? origMatch[1].trim() : '(scanned image)';
-    const translatedText = transMatch ? transMatch[1].trim() : raw;
-
-    const item = state.qtHistory.find(i => i.id === id);
-    if(item){
-      Object.assign(item, { pending: false, originalText, translatedText, detectedLang, photoUrl, usedOffline: false, approx: false });
-    }
-    if(originalText) tmSave('auto', targetLang.code, originalText, translatedText);
-    qtRenderHistory();
-    if(state.autoSpeak) speak(translatedText, targetLang);
-  } catch(e){
-    console.error('QT scan failed:', e);
-    showToast(`Scan translation အမှားဖြစ်သွားပါတယ်: ${e.message}`, 'error');
-    state.qtHistory = state.qtHistory.filter(i => i.id !== id);
-    qtRenderHistory();
-  }
-}
-
-let qtRecognition = null;
-let qtPttHoldActive = false;
-
-function qtStartRecognition(){
-  const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if(!SpeechRecognitionCtor){
-    showToast('ဒီ browser မှာ voice input ကို support မလုပ်ပါ။ Chrome ကို သုံးကြည့်ပါ။', 'error');
-    return;
-  }
-  if(qtRecognition){ try{ qtRecognition.stop(); }catch(e){} qtRecognition = null; }
-
-  const micLang = langByCode(state.qtMicCode) || LANGUAGES[0];
-  qtRecognition = new SpeechRecognitionCtor();
-  qtRecognition.lang = micLang.ttsLocale;
-  qtRecognition.continuous = false;
-  qtRecognition.interimResults = false;
-  qtRecognition.maxAlternatives = 1;
-  document.getElementById('qtMicBtn').classList.add('listening');
-
-  qtRecognition.onresult = (e) => {
-    const text = e.results[0][0].transcript;
-    if(text && text.trim()) qtTranslate(text, `🎙️ ${text}`);
-  };
-  qtRecognition.onerror = (e) => {
-    if(e.error !== 'no-speech' && e.error !== 'aborted'){
-      showToast('Voice input အမှားဖြစ်သွားပါတယ်: ' + e.error, 'error');
-    }
-  };
-  qtRecognition.onspeechend = () => { try{ qtRecognition.stop(); }catch(e){} };
-  qtRecognition.onend = () => {
-    qtRecognition = null;
-    document.getElementById('qtMicBtn').classList.remove('listening');
-  };
-
-  try{ qtRecognition.start(); } catch(e){
-    qtRecognition = null;
-    document.getElementById('qtMicBtn').classList.remove('listening');
-  }
-}
-function qtStopRecognition(){
-  if(qtRecognition){ try{ qtRecognition.stop(); }catch(e){} }
-}
-
-document.getElementById('qtMicBtn').addEventListener('click', () => {
-  if(qtRecognition){ qtStopRecognition(); return; }
-  qtStartRecognition();
-});
-
-document.getElementById('qtModeToggle').addEventListener('click', () => {
-  qtStopRecognition();
-  const toggle = document.getElementById('qtModeToggle');
-  const textWrap = document.getElementById('qtTextFieldWrap');
-  const pttWrap = document.getElementById('qtPttWrap');
-  const nowPtt = pttWrap.style.display === 'none';
-  textWrap.style.display = nowPtt ? 'none' : 'flex';
-  pttWrap.style.display = nowPtt ? 'flex' : 'none';
-  toggle.classList.toggle('active', nowPtt);
-  toggle.innerHTML = nowPtt ? svgKeyboard() : svgWalkieTalkie();
-  vibrate(10);
-});
-
-const qtPttCircle = document.getElementById('qtPttCircle');
-qtPttCircle.addEventListener('pointerdown', (e)=>{
-  e.preventDefault();
-  try{ qtPttCircle.setPointerCapture(e.pointerId); }catch(err){}
-  qtPttHoldActive = true;
-  vibrate(15);
-  qtPttCircle.classList.add('recording');
-  updateHoldCaption('QT', '🎙️ Recording... release to send');
-  startHoldRecording('QT');
-});
-const endQtPttHold = ()=>{
-  if(!qtPttHoldActive) return;
-  qtPttHoldActive = false;
-  vibrate(10);
-  qtPttCircle.classList.remove('recording');
-  stopWaveform('QT');
-  stopHoldRecording('QT');
-};
-qtPttCircle.addEventListener('pointerup', endQtPttHold);
-qtPttCircle.addEventListener('pointercancel', endQtPttHold);
-
-/* =========================================================
-   QUICK PHRASEBOOK — one-tap common phrases for migrant workers
-   (emergency, medical, workplace, housing, wages, immigration).
-   Inserts into the input box in the side's own language; sending
-   it afterward translates & speaks it as normal, and since these
-   exact phrases are also in the offline dictionary, they translate
-   accurately even with zero internet.
-========================================================= */
-const PB_CATEGORIES = [
-  {key:'emergency', label:'🚨 Emergency'},
-  {key:'medical', label:'🏥 Medical'},
-  {key:'workplace', label:'💼 Workplace'},
-  {key:'housing', label:'🏠 Housing'},
-  {key:'wages', label:'💰 Wages'},
-  {key:'immigration', label:'✈️ Immigration'},
-];
-let pbActiveCategory = 'emergency';
-let pbActiveSide = 'A';
-
-function pbRenderCategories(){
-  const el = document.getElementById('pbCategories');
-  el.innerHTML = PB_CATEGORIES.map(c => `
-    <button type="button" class="pbCatBtn ${c.key===pbActiveCategory?'active':''}" data-cat="${c.key}">${c.label}</button>
-  `).join('');
-  el.querySelectorAll('.pbCatBtn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      pbActiveCategory = btn.dataset.cat;
-      pbRenderCategories();
-      pbRenderPhrases();
-    });
-  });
-}
-
-function pbRenderPhrases(){
-  const el = document.getElementById('pbPhraseList');
-  const lang = pbActiveSide === 'A' ? state.langA : state.langB;
-  const items = PHRASEBOOK.filter(p => p.cat === pbActiveCategory);
-  el.innerHTML = items.map(p => {
-    const text = p[lang.code] || p.en;
-    return `<div class="pbPhraseItem" data-text="${escapeHtml(text).replace(/"/g,'&quot;')}">${escapeHtml(text)}</div>`;
-  }).join('');
-  el.querySelectorAll('.pbPhraseItem').forEach(item => {
-    item.addEventListener('click', () => {
-      const input = document.getElementById('input' + pbActiveSide);
-      input.value = item.dataset.text;
-      document.getElementById('phrasebookOverlay').classList.remove('show');
-      input.focus();
-      vibrate(10);
-    });
-  });
-}
-
-function pbOpen(side){
-  pbActiveSide = side;
-  pbRenderCategories();
-  pbRenderPhrases();
-  document.getElementById('phrasebookOverlay').classList.add('show');
-}
-
-document.getElementById('pbCloseBtn').addEventListener('click', () => {
-  document.getElementById('phrasebookOverlay').classList.remove('show');
-});
-document.getElementById('phrasebookOverlay').addEventListener('click', (e) => {
-  if(e.target.id === 'phrasebookOverlay') document.getElementById('phrasebookOverlay').classList.remove('show');
-});
-
-/* =========================================================
-   TYPE OVERLAY — a normal, non-rotated typing sheet.
-   The rotated panel's native keyboard can't be flipped by CSS (it's a
-   system overlay, always in the phone's true physical orientation), so
-   whoever reads that panel right-side-up would see the keyboard upside
-   down. This overlay gives them a properly-oriented place to type instead.
-========================================================= */
-let typeOverlaySide = 'A';
-function openTypeOverlay(side){
-  typeOverlaySide = side;
-  const input = document.getElementById('typeOverlayInput');
-  input.value = document.getElementById('input'+side).value;
-  document.getElementById('typeOverlay').classList.add('show');
-  setTimeout(()=>input.focus(), 50);
-}
-function closeTypeOverlay(){
-  document.getElementById('typeOverlay').classList.remove('show');
-}
-document.getElementById('typeOverlayCloseBtn').addEventListener('click', closeTypeOverlay);
-document.getElementById('typeOverlay').addEventListener('click', (e)=>{
-  if(e.target.id === 'typeOverlay') closeTypeOverlay();
-});
-document.getElementById('typeOverlaySendBtn').addEventListener('click', ()=>{
-  const text = document.getElementById('typeOverlayInput').value;
-  if(!text.trim()) return;
-  closeTypeOverlay();
-  vibrate(10);
-  handleTranslation(text, typeOverlaySide, false);
-});
-document.getElementById('typeOverlayInput').addEventListener('keydown', (e)=>{
-  if(e.key === 'Enter' && !e.shiftKey){
-    e.preventDefault();
-    document.getElementById('typeOverlaySendBtn').click();
-  }
-});
-attachDictation(
-  document.getElementById('typeOverlayInput'),
-  document.getElementById('typeOverlayDictateBtn'),
-  () => (typeOverlaySide === 'A' ? state.langA : state.langB)
-);
-
-qtPopulateSelects();
-qtRenderHistory();
-
-/* =========================================================
-   INIT
-========================================================= */
-try{
-  const savedKey = localStorage.getItem('wt_apiKey');
-  const savedProxyUrl = localStorage.getItem('wt_proxyUrl');
-  const savedBackendMode = localStorage.getItem('wt_backendMode');
-  const savedOffline = localStorage.getItem('wt_offlineForced');
-  const savedRate = localStorage.getItem('wt_speechRate');
-  const savedAutoSpeak = localStorage.getItem('wt_autoSpeak');
-  const savedShowSub = localStorage.getItem('wt_showTranslatedOut');
-  const savedTheme = localStorage.getItem('wt_lightTheme');
-  const savedTone = localStorage.getItem('wt_tone');
-  const savedQtDomain = localStorage.getItem('wt_qtDomain');
-  const savedVoiceEngine = localStorage.getItem('wt_voiceEngine');
-  const savedGlossary = localStorage.getItem('wt_glossary');
-  const savedSaveHistory = localStorage.getItem('wt_saveHistory');
-  if(savedKey) state.apiKey = savedKey;
-  if(savedProxyUrl) state.proxyUrl = savedProxyUrl;
-  if(savedBackendMode) state.backendMode = savedBackendMode;
-  if(savedOffline !== null) state.offlineForced = savedOffline === '1';
-  if(savedRate) state.speechRate = parseFloat(savedRate);
-  if(savedAutoSpeak !== null) state.autoSpeak = savedAutoSpeak === '1';
-  if(savedShowSub !== null) state.showTranslatedOut = savedShowSub === '1';
-  if(savedTheme === '1'){ state.lightTheme = true; document.body.classList.add('light-theme'); }
-  if(savedTone) state.tone = savedTone;
-  if(savedQtDomain) state.qtDomain = savedQtDomain;
-  if(savedVoiceEngine) state.voiceEngine = savedVoiceEngine;
-  if(savedGlossary) state.glossary = savedGlossary;
-  if(savedSaveHistory !== null) state.saveHistory = savedSaveHistory === '1';
-
-  if(state.saveHistory){
-    const savedMsgs = localStorage.getItem('wt_messages');
-    if(savedMsgs) state.messages = JSON.parse(savedMsgs);
-  }
-}catch(e){ /* storage unavailable — falls back to blank each launch */ }
-
-renderStatusBar();
-renderPanel('A');
-renderPanel('B');
-qtPopulateDomains();
-qtRenderSuggestions();
-showView('home');
-liveInitLangSelects();
-
-// First-launch onboarding: explain the rotated face-to-face panel design.
-try{
-  if(!localStorage.getItem('wt_onboardingSeen')){
-    document.getElementById('onboardingOverlay').classList.add('show');
-  }
-}catch(e){}
-document.getElementById('onboardingCloseBtn').addEventListener('click', ()=>{
-  document.getElementById('onboardingOverlay').classList.remove('show');
-  try{ localStorage.setItem('wt_onboardingSeen', '1'); }catch(e){}
-});
-
-if('serviceWorker' in navigator){
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('service-worker.js').then((reg) => {
-      // Check for a newer service-worker.js every time the app opens.
-      reg.update().catch(()=>{});
-    }).catch(()=>{});
-  });
-
-  // When a new service worker takes over (i.e. an update was found and
-  // installed), reload once automatically so the fresh version is shown
-  // without the person needing to manually clear cache.
-  let refreshed = false;
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if(refreshed) return;
-    refreshed = true;
-    window.location.reload();
-  });
-}
+        if(origMat

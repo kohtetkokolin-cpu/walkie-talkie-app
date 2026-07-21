@@ -227,15 +227,31 @@
       <div class="fieldHint" style="margin-bottom:14px;">"My Own Key" = key ကို ဒီ device ထဲမှာပဲ သိမ်းထားမယ် (personal use အတွက် လုံလောက်ပါတယ်၊ ဒါပေမယ့် device တစ်ခြားသူလက်ထဲရောက်ရင် (သို့) app ကို public ဖြန့်ရင် key ပေါက်ကြားနိုင်ပါတယ်)။ "Secure Proxy" = key ကို client မှာ လုံးဝမသိမ်းဘဲ backend server (Cloudflare Worker) ကနေတစ်ဆင့် ခေါ်မယ် — ✅ Recommended — အများသုံးအောင် app ဖြန့်မယ်ဆိုရင် ဒါကိုပဲ သုံးသင့်ပါတယ်။</div>
 
       <div id="ownKeyFields">
-        <label class="fieldLabel">AI Translation Key</label>
-        <input id="apiKeyInput" type="password" autocomplete="off" placeholder="AIzaSy...">
-        <div class="fieldHint">Key ကို <a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a> မှာ အခမဲ့ ရယူနိုင်ပါတယ်။ Key ကို ဖုန်းထဲမှာပဲ သိမ်းထားပြီး ဘယ်နေရာကိုမှ ပို့မထားပါ (Live Mode သုံးရင်တော့ key ကို Google ဆီ connect လုပ်ဖို့ URL ထဲ ထည့်ပို့ရပါတယ်)။ Public device (စျေး/အင်တာနက်ဆိုင်) မှာ မသုံးဖို့ အကြံပြုပါတယ်။</div>
+        <label class="fieldLabel">AI Translation Key(s)</label>
+        <input id="apiKeyInput" type="password" autocomplete="off" placeholder="Key 1 (primary) — AIzaSy...">
+        <input id="apiKeyInput2" type="password" autocomplete="off" placeholder="Key 2 (backup, optional)" style="margin-top:6px;">
+        <input id="apiKeyInput3" type="password" autocomplete="off" placeholder="Key 3 (backup, optional)" style="margin-top:6px;">
+        <div class="fieldHint">Key ကို <a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a> မှာ အခမဲ့ ရယူနိုင်ပါတယ်။ Key 1 ရဲ့ quota ကုန်သွားရင် (429 error) app က **အလိုအလျောက် Key 2 → Key 3 ကို ပြောင်းသုံး**ပေးပါလိမ့်မယ် — Google account တစ်ခုစီရဲ့ free-tier quota က သီးခြားစီရှိလို့ key အများကြီးထည့်လေ တစ်နေ့ကို သုံးလို့ရတဲ့ ပမာဏ တိုးလေဖြစ်ပါတယ်။ Key တွေကို ဖုန်းထဲမှာပဲ သိမ်းထားပြီး ဘယ်နေရာကိုမှ ပို့မထားပါ (Live Mode သုံးရင်တော့ active key ကို Google ဆီ connect လုပ်ဖို့ URL ထဲ ထည့်ပို့ရပါတယ်)။ Public device (စျေး/အင်တာနက်ဆိုင်) မှာ မသုံးဖို့ အကြံပြုပါတယ်။</div>
       </div>
       <div id="proxyFields" style="display:none;">
         <label class="fieldLabel">Proxy URL</label>
         <input id="proxyUrlInput" type="url" placeholder="https://your-worker.workers.dev">
         <div class="fieldHint">Cloudflare Worker (ဒါမှမဟုတ် တခြား backend) ရဲ့ URL ကို ထည့်ပါ — API key ကို client ဘက်ကနေ လုံးဝ မပို့တော့ပါ။</div>
       </div>
+
+      <hr class="divide">
+      <div class="toggleRow" style="margin-top:0;">
+        <div>
+          <div style="font-size:13px;font-weight:700;">Fallback Translation (MyMemory)</div>
+          <div class="desc">AI key/quota အားလုံး ကုန်သွားရင် (သို့) error တက်ရင် — key မလိုတဲ့ free MyMemory service ကို အလိုအလျောက် ပြောင်းသုံးမယ် (quality Gemini လောက်တော့ မဟုတ်ပါ)။ ဒါတောင် မရမှသာ offline dictionary ကို ပြန်ကျမယ်။</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="myMemoryToggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <input id="myMemoryEmailInput" type="email" placeholder="Email (optional — 5,000→50,000 char/day free)" style="margin-top:8px;">
+      <div class="fieldHint">Email ထည့်စရာမလိုပါ — ထည့်ရင် MyMemory ရဲ့ တစ်နေ့စာ အခမဲ့ ကန့်သတ်ချက်ကို ၁၀ဆ တိုးပေးပါတယ် (registration/verification မလိုပါ)။</div>
 
       <hr class="divide">
       <div class="toggleRow" style="margin-top:0;">

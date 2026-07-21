@@ -336,6 +336,7 @@
     margin-bottom:12px;
   }
   .offlineBadge{color:#888;font-size:8px;font-weight:700;border:1px solid #555;border-radius:8px;padding:1px 5px;}
+  .myMemoryBadge{color:#b388ff;font-size:8px;font-weight:700;border:1px solid #b388ff;border-radius:8px;padding:1px 5px;}
 
   /* ===== Input Row ===== */
   .inputRow{

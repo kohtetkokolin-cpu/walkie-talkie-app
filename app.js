@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.18-r4';
+const APP_VERSION = '2026.07.19-r1';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');
@@ -24,6 +24,64 @@ function showToast(message, type){
 // Turns a raw HTTP status (+ optionally the response body, only used for
 // console logging by the caller) into a short, friendly Burmese message.
 // The raw JSON never reaches the chat bubble — only this classification does.
+/**
+ * Free fallback translation via MyMemory — no API key needed at all, works
+ * directly from the browser (CORS-enabled). Used automatically when Gemini
+ * is unreachable or every configured key has hit its quota. Quality is
+ * noticeably below Gemini (crowdsourced translation memory + basic MT),
+ * but it handles arbitrary sentences — unlike the offline dictionary,
+ * which only matches known phrases. Returns null on any failure so the
+ * caller can fall through to the offline dictionary as the last resort.
+ */
+async function translateViaMyMemory(text, sourceCode, targetCode){
+  if(!text || !text.trim()) return null;
+  try{
+    const params = new URLSearchParams({
+      q: text.slice(0, 490), // MyMemory's free tier caps ~500 bytes per request
+      langpair: `${sourceCode}|${targetCode}`,
+    });
+    if(state.myMemoryEmail) params.set('de', state.myMemoryEmail);
+    const resp = await fetch(`https://api.mymemory.translated.net/get?${params.toString()}`);
+    if(!resp.ok) return null;
+    const data = await resp.json();
+    const result = data && data.responseData && data.responseData.translatedText;
+    if(!result) return null;
+    // MyMemory returns plain-English warning strings (not an HTTP error)
+    // when a language pair is unsupported or the daily limit is hit.
+    if(/MYMEMORY WARNING|QUERY LENGTH LIMIT|INVALID (SOURCE|TARGET) LANGUAGE|AMOUNT OF WORDS/i.test(result)) return null;
+    return result;
+  }catch(e){
+    console.error('MyMemory fallback failed:', e);
+    return null;
+  }
+}
+
+/**
+ * Shared fallback chain used whenever Gemini is unavailable/exhausted:
+ * try free key-less MyMemory first (handles arbitrary sentences), then the
+ * offline phrase dictionary as the last resort. sourceCode can be
+ * 'autodetect' for Quick Translate, where the source language isn't known.
+ */
+async function fallbackTranslateChain(text, sourceCode, targetCode){
+  if(state.myMemoryEnabled && !state.offlineForced){
+    const mm = await translateViaMyMemory(text, sourceCode, targetCode);
+    if(mm) return { text: mm, approx: true, usedMyMemory: true };
+  }
+  if(sourceCode !== 'autodetect'){
+    const off = offlineTranslate(text, sourceCode, targetCode);
+    if(off) return { text: off.text, approx: off.approx, usedMyMemory: false };
+  } else {
+    // Quick Translate doesn't know the source language — try the offline
+    // dictionary assuming each known language as a possible source.
+    for(const l of LANGUAGES){
+      if(l.code === targetCode) continue;
+      const off = offlineTranslate(text, l.code, targetCode);
+      if(off) return { text: off.text, approx: off.approx, usedMyMemory: false };
+    }
+  }
+  return null;
+}
+
 function friendlyApiError(status){
   if(status === 429) return '⏳ AI quota ကုန်သွားပါပြီ (daily limit) — offline dictionary နဲ့ ပြန်ပြထားပါတယ်';
   if(status === 401 || status === 403) return '🔑 API key မှားနေနိုင်ပါတယ် — Settings → Account မှာ key ပြန်စစ်ပေးပါ';
@@ -130,6 +188,10 @@ const state = {
   langB: langByCode('my'),
   messages: [], // newest first
   apiKey: '',
+  apiKeys: ['', '', ''], // up to 3 keys; state.apiKey mirrors apiKeys[apiKeyIndex]
+  apiKeyIndex: 0,
+  myMemoryEnabled: true,
+  myMemoryEmail: '',
   offlineForced: false,
   listening: {A:false, B:false},
   translating: {A:false, B:false},
@@ -817,7 +879,7 @@ function pcmBase64ToWavBlob(base64, sampleRate){
  */
 function hasBackend(){
   if(state.backendMode === 'proxy') return !!state.proxyUrl;
-  return !!state.apiKey;
+  return state.apiKeys.some(k => (k||'').trim()) || !!state.apiKey;
 }
 
 /**
@@ -836,12 +898,42 @@ const sessionApiStats = { calls: 0, retried: 0 };
 let apiThrottleQueue = Promise.resolve();
 const API_MIN_GAP_MS = 350;
 
+/**
+ * Rotates state.apiKey to the next configured (non-empty) key. Used when a
+ * call comes back 429 (quota exceeded) — Google's free-tier quota is
+ * per-project/per-account, so a second personal key has its own separate
+ * allowance. Returns false if there's nothing else to rotate to (only one
+ * key configured, or already cycled through all of them this call).
+ */
+function rotateApiKey(){
+  const keys = state.apiKeys.map(k => (k||'').trim()).filter(Boolean);
+  if(keys.length <= 1) return false;
+  const currentPos = keys.indexOf(state.apiKey);
+  const nextKey = keys[(currentPos + 1) % keys.length];
+  if(nextKey === state.apiKey) return false;
+  state.apiKey = nextKey;
+  state.apiKeyIndex = state.apiKeys.findIndex(k => (k||'').trim() === nextKey);
+  return true;
+}
+
 function apiThrottle(doFetch){
   const run = apiThrottleQueue.then(async () => {
     sessionApiStats.calls++;
     updateApiUsageBadge();
     let resp = await doFetch();
+    const keyCount = state.apiKeys.filter(k => (k||'').trim()).length;
+    let rotations = 0;
+    while(resp && resp.status === 429 && rotations < keyCount - 1){
+      sessionApiStats.retried++;
+      if(!rotateApiKey()) break;
+      showToast('🔄 Key quota ကုန်သွားလို့ backup key ကို ပြောင်းသုံးနေပါတယ်...', 'warn');
+      resp = await doFetch();
+      rotations++;
+    }
     if(resp && resp.status === 429){
+      // Either only one key configured, or every key just came back 429 —
+      // one short-wait retry in case it was a transient burst limit rather
+      // than the hard daily quota.
       sessionApiStats.retried++;
       await new Promise(r => setTimeout(r, 1200));
       resp = await doFetch();
@@ -1112,6 +1204,7 @@ async function handleTranslation(rawText, sender, isVoice){
   let translated = '';
   let approx = false;
   let usedOffline = false;
+  let usedMyMemory = false;
   let errorDetail = '';
 
   async function fallbackOffline(prefix){
@@ -1122,9 +1215,15 @@ async function handleTranslation(rawText, sender, isVoice){
       approx = false; // this is a real, previously-verified AI translation, not a guess
       return;
     }
-    const off = offlineTranslate(rawText, sourceLang.code, targetLang.code);
-    if(off){ translated = off.text; approx = off.approx; }
-    else { translated = `${prefix} ${rawText}`; approx = true; }
+    const result = await fallbackTranslateChain(rawText, sourceLang.code, targetLang.code);
+    if(result){
+      translated = result.text;
+      approx = result.approx;
+      usedMyMemory = result.usedMyMemory;
+    } else {
+      translated = `${prefix} ${rawText}`;
+      approx = true;
+    }
   }
 
   if(state.offlineForced || !hasBackend()){
@@ -1211,6 +1310,7 @@ async function handleTranslation(rawText, sender, isVoice){
     msg.translatedText = translated;
     msg.approx = approx;
     msg.usedOffline = usedOffline;
+    msg.usedMyMemory = usedMyMemory;
     msg.errorDetail = errorDetail;
     msg.pending = false;
   }
@@ -1522,7 +1622,7 @@ function renderChatLog(side){
             <div class="badges">
               ${msg.isVoice ? `<svg class="voiceIcon" viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/></svg>` : ''}
               ${msg.isScan ? `<span class="scanBadge">📷 scan</span>` : ''}
-              ${msg.usedOffline ? (msg.approx ? `<span class="offlineBadge">offline</span>` : `<span class="memoryBadge">✓ remembered</span>`) : ''}
+              ${msg.usedOffline ? (msg.usedMyMemory ? `<span class="myMemoryBadge">MyMemory</span>` : (msg.approx ? `<span class="offlineBadge">offline</span>` : `<span class="memoryBadge">✓ remembered</span>`)) : ''}
               ${msg.approx ? `<span class="approxBadge">≈ approx</span>` : ''}
             </div>
           </div>
@@ -1772,7 +1872,11 @@ document.getElementById('settingsBtn').addEventListener('click', ()=>{
   document.querySelectorAll('.settingsPane').forEach(pane => {
     pane.style.display = pane.dataset.pane === 'account' ? 'block' : 'none';
   });
-  document.getElementById('apiKeyInput').value = state.apiKey;
+  document.getElementById('apiKeyInput').value = state.apiKeys[0] || '';
+  document.getElementById('apiKeyInput2').value = state.apiKeys[1] || '';
+  document.getElementById('apiKeyInput3').value = state.apiKeys[2] || '';
+  document.getElementById('myMemoryToggle').checked = state.myMemoryEnabled;
+  document.getElementById('myMemoryEmailInput').value = state.myMemoryEmail || '';
   document.getElementById('proxyUrlInput').value = state.proxyUrl;
   document.getElementById('ownKeyFields').style.display = state.backendMode === 'proxy' ? 'none' : 'block';
   document.getElementById('proxyFields').style.display = state.backendMode === 'proxy' ? 'block' : 'none';
@@ -1889,7 +1993,16 @@ document.getElementById('clearHistoryBtn').addEventListener('click', (e)=>{
   vibrate(20);
 });
 document.getElementById('applyBtn').addEventListener('click', ()=>{
-  state.apiKey = document.getElementById('apiKeyInput').value.trim();
+  state.apiKeys = [
+    document.getElementById('apiKeyInput').value.trim(),
+    document.getElementById('apiKeyInput2').value.trim(),
+    document.getElementById('apiKeyInput3').value.trim(),
+  ];
+  state.apiKeyIndex = state.apiKeys.findIndex(k => k);
+  if(state.apiKeyIndex === -1) state.apiKeyIndex = 0;
+  state.apiKey = state.apiKeys[state.apiKeyIndex] || '';
+  state.myMemoryEnabled = document.getElementById('myMemoryToggle').checked;
+  state.myMemoryEmail = document.getElementById('myMemoryEmailInput').value.trim();
   state.proxyUrl = document.getElementById('proxyUrlInput').value.trim();
   const activeBackendBtn = document.querySelector('#backendModeRow .speedBtn.active');
   if(activeBackendBtn) state.backendMode = activeBackendBtn.dataset.mode;
@@ -1907,7 +2020,9 @@ document.getElementById('applyBtn').addEventListener('click', ()=>{
   const activeEngineBtn = document.querySelector('#voiceEngineRow .speedBtn.active');
   if(activeEngineBtn) state.voiceEngine = activeEngineBtn.dataset.engine;
   try{
-    localStorage.setItem('wt_apiKey', state.apiKey);
+    localStorage.setItem('wt_apiKeys', JSON.stringify(state.apiKeys));
+    localStorage.setItem('wt_myMemoryEnabled', state.myMemoryEnabled ? '1' : '0');
+    localStorage.setItem('wt_myMemoryEmail', state.myMemoryEmail);
     localStorage.setItem('wt_proxyUrl', state.proxyUrl);
     localStorage.setItem('wt_backendMode', state.backendMode);
     localStorage.setItem('wt_offlineForced', state.offlineForced ? '1' : '0');
@@ -2128,7 +2243,7 @@ function qtRenderHistory(){
       ` : `
         <div class="qtBadges">
           ${item.detectedLang ? `<span class="qtDetected">Detected: ${escapeHtml(item.detectedLang)}</span>` : ''}
-          ${item.usedOffline ? (item.approx ? `<span class="offlineBadge">offline</span>` : `<span class="memoryBadge">✓ remembered</span>`) : ''}
+          ${item.usedOffline ? (item.usedMyMemory ? `<span class="myMemoryBadge">MyMemory</span>` : (item.approx ? `<span class="offlineBadge">offline</span>` : `<span class="memoryBadge">✓ remembered</span>`)) : ''}
         </div>
         ${item.photoUrl ? `<img src="${item.photoUrl}" class="scanThumb" alt="Scanned photo">` : ''}
         <div class="qtOriginal" data-qtid-orig="${item.id}">${escapeHtml(item.originalText)}</div>
@@ -2165,26 +2280,30 @@ async function qtTranslate(rawText, queryLabel){
   let translatedText = '';
   let detectedLang = '';
   let usedOffline = false;
+  let usedMyMemory = false;
   let approx = false;
 
-  if(state.offlineForced || !hasBackend()){
+  async function qtFallback(){
     usedOffline = true;
     const remembered = tmLookup('auto', targetLang.code, rawText);
     if(remembered){
       translatedText = remembered;
       approx = false;
-    } else {
-      // Heuristic: try the offline dictionary assuming each known language
-      // as the possible source, since we don't know what this text is.
-      let found = null;
-      for(const l of LANGUAGES){
-        if(l.code === targetLang.code) continue;
-        const off = offlineTranslate(rawText, l.code, targetLang.code);
-        if(off){ found = off; break; }
-      }
-      if(found){ translatedText = found.text; approx = found.approx; }
-      else { translatedText = `[Offline] ${rawText}`; approx = true; }
+      return;
     }
+    const result = await fallbackTranslateChain(rawText, 'autodetect', targetLang.code);
+    if(result){
+      translatedText = result.text;
+      approx = result.approx;
+      usedMyMemory = result.usedMyMemory;
+    } else {
+      translatedText = `[Offline] ${rawText}`;
+      approx = true;
+    }
+  }
+
+  if(state.offlineForced || !hasBackend()){
+    await qtFallback();
   } else {
     try{
       const domainHint = domainByCode(state.qtDomain).hint;
@@ -2228,20 +2347,23 @@ async function qtTranslate(rawText, queryLabel){
         if(translatedText){
           tmSave('auto', targetLang.code, rawText, translatedText);
         } else {
-          usedOffline = true; approx = true; translatedText = `[Empty response] ${rawText}`;
+          console.error('Gemini empty response for QT request');
+          await qtFallback();
         }
       } else {
-        usedOffline = true; approx = true; translatedText = `[Network Error] ${rawText}`;
+        console.error('Gemini API error (QT):', streamResult.status);
+        await qtFallback();
       }
     } catch(e){
-      usedOffline = true; approx = true; translatedText = `[Error Connection] ${rawText}`;
+      console.error('Gemini fetch failed (QT):', e);
+      await qtFallback();
     }
   }
 
   const item = state.qtHistory.find(i => i.id === id);
   if(item){
     Object.assign(item, {
-      pending: false, originalText: rawText, translatedText, detectedLang, usedOffline, approx
+      pending: false, originalText: rawText, translatedText, detectedLang, usedOffline, usedMyMemory, approx
     });
   }
   qtRenderHistory();
@@ -2626,7 +2748,10 @@ qtRenderHistory();
    INIT
 ========================================================= */
 try{
-  const savedKey = localStorage.getItem('wt_apiKey');
+  const savedKeysRaw = localStorage.getItem('wt_apiKeys');
+  const savedKeyOld = localStorage.getItem('wt_apiKey'); // pre-rotation format, migrated below
+  const savedMyMemoryEnabled = localStorage.getItem('wt_myMemoryEnabled');
+  const savedMyMemoryEmail = localStorage.getItem('wt_myMemoryEmail');
   const savedProxyUrl = localStorage.getItem('wt_proxyUrl');
   const savedBackendMode = localStorage.getItem('wt_backendMode');
   const savedOffline = localStorage.getItem('wt_offlineForced');
@@ -2639,7 +2764,20 @@ try{
   const savedVoiceEngine = localStorage.getItem('wt_voiceEngine');
   const savedGlossary = localStorage.getItem('wt_glossary');
   const savedSaveHistory = localStorage.getItem('wt_saveHistory');
-  if(savedKey) state.apiKey = savedKey;
+  if(savedKeysRaw){
+    try{
+      const parsed = JSON.parse(savedKeysRaw);
+      if(Array.isArray(parsed)) state.apiKeys = [parsed[0]||'', parsed[1]||'', parsed[2]||''];
+    }catch(e){}
+  } else if(savedKeyOld){
+    // One-time migration from the pre-rotation single-key format.
+    state.apiKeys = [savedKeyOld, '', ''];
+  }
+  state.apiKeyIndex = state.apiKeys.findIndex(k => k);
+  if(state.apiKeyIndex === -1) state.apiKeyIndex = 0;
+  state.apiKey = state.apiKeys[state.apiKeyIndex] || '';
+  if(savedMyMemoryEnabled !== null) state.myMemoryEnabled = savedMyMemoryEnabled === '1';
+  if(savedMyMemoryEmail) state.myMemoryEmail = savedMyMemoryEmail;
   if(savedProxyUrl) state.proxyUrl = savedProxyUrl;
   if(savedBackendMode) state.backendMode = savedBackendMode;
   if(savedOffline !== null) state.offlineForced = savedOffline === '1';

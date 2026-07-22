@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.19-r2';
+const APP_VERSION = '2026.07.19-r3';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');
@@ -89,6 +89,76 @@ async function fallbackTranslateChain(text, sourceCode, targetCode){
   }
   return null;
 }
+
+function buildTranslationPrompt(text, sourceLang, targetLang){
+  return `You are an expert interpreter helping two people communicate naturally in a live, real-time conversation. `
+    + `Translate the following message from ${sourceLang.name} into ${targetLang.name}.\n\n`
+    + `IMPORTANT: Do NOT translate word-for-word. Understand the full meaning, tone, and intent of the message, `
+    + `then express it the way a native ${targetLang.name} speaker would naturally say it out loud in this real-life situation `
+    + `(everyday / workplace conversation).\n\n`
+    + `Tone: ${toneInstruction()}\n`
+    + `${glossaryInstruction()}`
+    + `${conversationContextBlock()}`
+    + `\nRules:\n`
+    + `- If translating into Burmese, use natural, everyday spoken Burmese (not overly formal/literary), unless Tone above says otherwise.\n`
+    + `- If translating into Chinese, use the polite/respectful form (您) unless the tone is clearly casual.\n`
+    + `- If translating into Thai, include natural polite particles (ครับ/ค่ะ) where appropriate.\n`
+    + `- If translating into English, use natural, conversational English.\n\n`
+    + `Return ONLY the translated sentence itself — no explanations, no notes, no quotation marks, no pronunciation guides.\n\n`
+    + `Message to translate now: "${text}"`;
+}
+
+/**
+ * Auto-retry queue for messages that failed purely because there was no
+ * connectivity (as opposed to a quota/server error, which needs waiting
+ * out rather than an immediate retry). Queued silently, then retranslated
+ * automatically the moment the browser fires 'online' — no user action
+ * needed, and the message bubble updates in place once a real translation
+ * comes back.
+ */
+function queueForRetry(msgId, sender, rawText, sourceCode, targetCode){
+  if(state.retryQueue.some(q => q.msgId === msgId)) return;
+  state.retryQueue.push({ msgId, sender, rawText, sourceCode, targetCode });
+}
+
+async function processRetryQueue(){
+  if(!state.retryQueue.length || !hasBackend()) return;
+  const queue = state.retryQueue.splice(0, state.retryQueue.length);
+  showToast(`🔄 Internet ပြန်ရလာလို့ message ${queue.length} ခု ပြန်ဘာသာပြန်နေပါတယ်...`, 'info');
+  for(const item of queue){
+    const msg = state.messages.find(m => m.id === item.msgId);
+    if(!msg) continue; // message no longer exists (history cleared etc.)
+    const sourceLang = langByCode(item.sourceCode);
+    const targetLang = langByCode(item.targetCode);
+    if(!sourceLang || !targetLang) continue;
+    try{
+      const resp = await geminiFetch('gemini-3.5-flash', {
+        contents: [{ parts: [{ text: buildTranslationPrompt(item.rawText, sourceLang, targetLang) }] }],
+        generationConfig: { temperature: 0.4, maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: 'minimal' } }
+      });
+      if(resp.ok){
+        const data = await resp.json();
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        if(text){
+          msg.translatedText = text;
+          msg.approx = false;
+          msg.usedOffline = false;
+          msg.usedMyMemory = false;
+          msg.connectivityFailure = false;
+          msg.errorDetail = '';
+          tmSave(item.sourceCode, item.targetCode, item.rawText, text);
+          continue;
+        }
+      }
+      state.retryQueue.push(item); // still failing — try again on the next 'online' event
+    }catch(e){
+      state.retryQueue.push(item);
+    }
+  }
+  renderPanel('A'); renderPanel('B');
+}
+
+window.addEventListener('online', () => { processRetryQueue(); });
 
 function friendlyApiError(status){
   if(status === 429) return '⏳ AI quota ကုန်သွားပါပြီ (daily limit) — offline dictionary နဲ့ ပြန်ပြထားပါတယ်';
@@ -200,6 +270,8 @@ const state = {
   apiKeyIndex: 0,
   myMemoryEnabled: true,
   myMemoryEmail: '',
+  exhaustedKeysToday: {},
+  retryQueue: [], // messages that failed purely due to no connectivity, retried automatically when back online
   offlineForced: false,
   listening: {A:false, B:false},
   translating: {A:false, B:false},
@@ -907,18 +979,55 @@ let apiThrottleQueue = Promise.resolve();
 const API_MIN_GAP_MS = 350;
 
 /**
+ * Proactive quota tracking. We don't know each key's exact daily limit (it
+ * varies and Google doesn't reliably expose remaining quota), so instead
+ * of guessing a number, we remember which keys *actually* hit a 429 today
+ * and steer new calls away from them — rather than waiting for them to
+ * fail again before rotating. Resets naturally each day since a stale
+ * date string just stops matching "today".
+ */
+function todayStr(){ return new Date().toISOString().slice(0, 10); }
+
+function markKeyExhausted(key){
+  if(!key) return;
+  state.exhaustedKeysToday[key] = todayStr();
+  try{ localStorage.setItem('wt_exhaustedKeys', JSON.stringify(state.exhaustedKeysToday)); }catch(e){}
+}
+
+function isKeyExhaustedToday(key){
+  return !!key && state.exhaustedKeysToday[key] === todayStr();
+}
+
+// Called before starting a new translation — switches state.apiKey to the
+// first configured key that hasn't already 429'd today, if the current
+// one has. Doesn't touch anything if the current key still looks fine.
+function pickBestApiKey(){
+  const keys = state.apiKeys.map(k => (k||'').trim()).filter(Boolean);
+  if(keys.length <= 1) return;
+  if(!isKeyExhaustedToday(state.apiKey)) return;
+  const fresh = keys.find(k => !isKeyExhaustedToday(k));
+  if(fresh){
+    state.apiKey = fresh;
+    state.apiKeyIndex = state.apiKeys.findIndex(k => (k||'').trim() === fresh);
+  }
+  // If every key is exhausted, leave it as-is — apiThrottle's normal 429
+  // handling (rotate + final wait/retry) still applies as a last resort.
+}
+
+/**
  * Rotates state.apiKey to the next configured (non-empty) key. Used when a
  * call comes back 429 (quota exceeded) — Google's free-tier quota is
  * per-project/per-account, so a second personal key has its own separate
- * allowance. Returns false if there's nothing else to rotate to (only one
- * key configured, or already cycled through all of them this call).
+ * allowance. Prefers a key that hasn't already 429'd today. Returns false
+ * if there's nothing else to rotate to.
  */
 function rotateApiKey(){
   const keys = state.apiKeys.map(k => (k||'').trim()).filter(Boolean);
   if(keys.length <= 1) return false;
   const currentPos = keys.indexOf(state.apiKey);
-  const nextKey = keys[(currentPos + 1) % keys.length];
-  if(nextKey === state.apiKey) return false;
+  const ordered = keys.slice(currentPos + 1).concat(keys.slice(0, currentPos + 1));
+  const nextKey = ordered.find(k => k !== state.apiKey && !isKeyExhaustedToday(k)) || ordered.find(k => k !== state.apiKey);
+  if(!nextKey || nextKey === state.apiKey) return false;
   state.apiKey = nextKey;
   state.apiKeyIndex = state.apiKeys.findIndex(k => (k||'').trim() === nextKey);
   return true;
@@ -926,6 +1035,7 @@ function rotateApiKey(){
 
 function apiThrottle(doFetch){
   const run = apiThrottleQueue.then(async () => {
+    pickBestApiKey();
     sessionApiStats.calls++;
     updateApiUsageBadge();
     let resp = await doFetch();
@@ -934,6 +1044,7 @@ function apiThrottle(doFetch){
     let rotations = 0;
     while(isRetryable(resp) && rotations < keyCount - 1){
       sessionApiStats.retried++;
+      if(resp.status === 429) markKeyExhausted(state.apiKey);
       if(!rotateApiKey()) break;
       showToast(resp.status === 429
         ? '🔄 Key quota ကုန်သွားလို့ backup key ကို ပြောင်းသုံးနေပါတယ်...'
@@ -945,6 +1056,7 @@ function apiThrottle(doFetch){
       // Either only one key configured, or every key just failed the same
       // way — one short-wait retry in case it was transient (a burst limit,
       // or a brief Google server hiccup) rather than a hard/persistent error.
+      if(resp.status === 429) markKeyExhausted(state.apiKey);
       sessionApiStats.retried++;
       await new Promise(r => setTimeout(r, 1200));
       resp = await doFetch();
@@ -1217,6 +1329,7 @@ async function handleTranslation(rawText, sender, isVoice){
   let usedOffline = false;
   let usedMyMemory = false;
   let errorDetail = '';
+  let connectivityFailure = false;
 
   async function fallbackOffline(prefix){
     usedOffline = true;
@@ -1241,21 +1354,7 @@ async function handleTranslation(rawText, sender, isVoice){
     await fallbackOffline('[Offline]');
   } else {
     try{
-      const prompt = `You are an expert interpreter helping two people communicate naturally in a live, real-time conversation. `
-        + `Translate the following message from ${sourceLang.name} into ${targetLang.name}.\n\n`
-        + `IMPORTANT: Do NOT translate word-for-word. Understand the full meaning, tone, and intent of the message, `
-        + `then express it the way a native ${targetLang.name} speaker would naturally say it out loud in this real-life situation `
-        + `(everyday / workplace conversation).\n\n`
-        + `Tone: ${toneInstruction()}\n`
-        + `${glossaryInstruction()}`
-        + `${conversationContextBlock()}`
-        + `\nRules:\n`
-        + `- If translating into Burmese, use natural, everyday spoken Burmese (not overly formal/literary), unless Tone above says otherwise.\n`
-        + `- If translating into Chinese, use the polite/respectful form (您) unless the tone is clearly casual.\n`
-        + `- If translating into Thai, include natural polite particles (ครับ/ค่ะ) where appropriate.\n`
-        + `- If translating into English, use natural, conversational English.\n\n`
-        + `Return ONLY the translated sentence itself — no explanations, no notes, no quotation marks, no pronunciation guides.\n\n`
-        + `Message to translate now: "${rawText}"`;
+      const prompt = buildTranslationPrompt(rawText, sourceLang, targetLang);
 
       // Tracks whether we've already done the one-time structural render
       // that swaps the "translating…" spinner for the real text+controls
@@ -1310,7 +1409,8 @@ async function handleTranslation(rawText, sender, isVoice){
         await fallbackOffline('[Network Error]');
       }
     } catch(e){
-      errorDetail = 'Internet connection မရပါ — Wi-Fi/mobile data စစ်ကြည့်ပါ';
+      errorDetail = 'Internet connection မရပါ — connection ပြန်ရလာရင် အလိုအလျောက် ထပ်ကြိုးစားပေးပါမယ်';
+      connectivityFailure = true;
       console.error('Gemini fetch failed:', e);
       await fallbackOffline('[Error Connection]');
     }
@@ -1324,6 +1424,8 @@ async function handleTranslation(rawText, sender, isVoice){
     msg.usedMyMemory = usedMyMemory;
     msg.errorDetail = errorDetail;
     msg.pending = false;
+    msg.connectivityFailure = connectivityFailure;
+    if(connectivityFailure) queueForRetry(msgId, sender, rawText, sourceLang.code, targetLang.code);
   }
 
   state.translating[sender] = false;
@@ -1634,6 +1736,7 @@ function renderChatLog(side){
               ${msg.isVoice ? `<svg class="voiceIcon" viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/></svg>` : ''}
               ${msg.isScan ? `<span class="scanBadge">📷 scan</span>` : ''}
               ${msg.usedOffline ? (msg.usedMyMemory ? `<span class="myMemoryBadge">MyMemory</span>` : (msg.approx ? `<span class="offlineBadge">offline</span>` : `<span class="memoryBadge">✓ remembered</span>`)) : ''}
+              ${msg.connectivityFailure ? `<span class="offlineBadge">🔌 queued</span>` : ''}
               ${msg.approx ? `<span class="approxBadge">≈ approx</span>` : ''}
             </div>
           </div>
@@ -2760,6 +2863,10 @@ qtRenderHistory();
 ========================================================= */
 try{
   const savedKeysRaw = localStorage.getItem('wt_apiKeys');
+  const savedExhausted = localStorage.getItem('wt_exhaustedKeys');
+  if(savedExhausted){
+    try{ state.exhaustedKeysToday = JSON.parse(savedExhausted) || {}; }catch(e){}
+  }
   const savedKeyOld = localStorage.getItem('wt_apiKey'); // pre-rotation format, migrated below
   const savedMyMemoryEnabled = localStorage.getItem('wt_myMemoryEnabled');
   const savedMyMemoryEmail = localStorage.getItem('wt_myMemoryEmail');

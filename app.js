@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.19-r1';
+const APP_VERSION = '2026.07.19-r2';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');
@@ -49,6 +49,14 @@ async function translateViaMyMemory(text, sourceCode, targetCode){
     // MyMemory returns plain-English warning strings (not an HTTP error)
     // when a language pair is unsupported or the daily limit is hit.
     if(/MYMEMORY WARNING|QUERY LENGTH LIMIT|INVALID (SOURCE|TARGET) LANGUAGE|AMOUNT OF WORDS/i.test(result)) return null;
+    // MyMemory's match score (0–1) reflects how close the crowdsourced TM
+    // entry actually is to the input. Low-confidence matches can come back
+    // completely unrelated to what was said (seen in testing: an unrelated
+    // English sentence for ordinary Burmese conversation) — showing that as
+    // if it were a real translation is worse than falling through to the
+    // offline dictionary, so reject anything below a reasonable bar.
+    const match = Number(data?.responseData?.match);
+    if(!isNaN(match) && match < 0.6) return null;
     return result;
   }catch(e){
     console.error('MyMemory fallback failed:', e);
@@ -921,19 +929,22 @@ function apiThrottle(doFetch){
     sessionApiStats.calls++;
     updateApiUsageBadge();
     let resp = await doFetch();
+    const isRetryable = (r) => r && (r.status === 429 || r.status >= 500);
     const keyCount = state.apiKeys.filter(k => (k||'').trim()).length;
     let rotations = 0;
-    while(resp && resp.status === 429 && rotations < keyCount - 1){
+    while(isRetryable(resp) && rotations < keyCount - 1){
       sessionApiStats.retried++;
       if(!rotateApiKey()) break;
-      showToast('🔄 Key quota ကုန်သွားလို့ backup key ကို ပြောင်းသုံးနေပါတယ်...', 'warn');
+      showToast(resp.status === 429
+        ? '🔄 Key quota ကုန်သွားလို့ backup key ကို ပြောင်းသုံးနေပါတယ်...'
+        : '🔄 Server error ကြုံနေလို့ backup key ကို ပြောင်းစမ်းနေပါတယ်...', 'warn');
       resp = await doFetch();
       rotations++;
     }
-    if(resp && resp.status === 429){
-      // Either only one key configured, or every key just came back 429 —
-      // one short-wait retry in case it was a transient burst limit rather
-      // than the hard daily quota.
+    if(isRetryable(resp)){
+      // Either only one key configured, or every key just failed the same
+      // way — one short-wait retry in case it was transient (a burst limit,
+      // or a brief Google server hiccup) rather than a hard/persistent error.
       sessionApiStats.retried++;
       await new Promise(r => setTimeout(r, 1200));
       resp = await doFetch();

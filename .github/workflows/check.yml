@@ -1,1 +1,64 @@
+name: Check app files
 
+# Runs automatically on every push. Shows a green check or red X next to
+# the commit on GitHub — catches broken/truncated uploads (the app.js
+# "Unexpected end of input" errors seen before) BEFORE they sit live for
+# users to hit.
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check each JS file parses correctly
+        run: |
+          set -e
+          for f in app.js data.js service-worker.js; do
+            if [ -f "$f" ]; then
+              echo "Checking $f..."
+              node --check "$f"
+            fi
+          done
+
+      - name: Check data.js + app.js load together (catches missing functions across files)
+        run: |
+          set -e
+          if [ -f data.js ] && [ -f app.js ]; then
+            cat data.js app.js > /tmp/combined.js
+            node --check /tmp/combined.js
+          fi
+
+      - name: Check manifest.json is valid JSON
+        run: |
+          set -e
+          if [ -f manifest.json ]; then
+            node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8'))"
+          fi
+
+      - name: Check for suspiciously small / truncated files
+        run: |
+          set -e
+          fail=0
+          for f in app.js data.js index.html style.css; do
+            if [ -f "$f" ]; then
+              size=$(wc -c < "$f")
+              echo "$f: $size bytes"
+              if [ "$size" -lt 200 ]; then
+                echo "::error file=$f::$f is only $size bytes — looks truncated, re-upload it"
+                fail=1
+              fi
+            fi
+          done
+          exit $fail

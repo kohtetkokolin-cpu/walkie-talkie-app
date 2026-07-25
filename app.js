@@ -7,7 +7,7 @@
 /* =========================================================
    LANGUAGES
 ========================================================= */
-const APP_VERSION = '2026.07.19-r3';
+const APP_VERSION = '2026.07.19-r4';
 
 function showToast(message, type){
   const container = document.getElementById('toastContainer');
@@ -132,7 +132,7 @@ async function processRetryQueue(){
     const targetLang = langByCode(item.targetCode);
     if(!sourceLang || !targetLang) continue;
     try{
-      const resp = await geminiFetch('gemini-3.5-flash', {
+      const resp = await geminiFetch('gemini-3.6-flash', {
         contents: [{ parts: [{ text: buildTranslationPrompt(item.rawText, sourceLang, targetLang) }] }],
         generationConfig: { temperature: 0.4, maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: 'minimal' } }
       });
@@ -1053,13 +1053,17 @@ function apiThrottle(doFetch){
       rotations++;
     }
     if(isRetryable(resp)){
-      // Either only one key configured, or every key just failed the same
-      // way — one short-wait retry in case it was transient (a burst limit,
-      // or a brief Google server hiccup) rather than a hard/persistent error.
       if(resp.status === 429) markKeyExhausted(state.apiKey);
-      sessionApiStats.retried++;
-      await new Promise(r => setTimeout(r, 1200));
-      resp = await doFetch();
+      // A 429 after exhausting every key rotation isn't going to fix itself
+      // in a second — that's a real daily quota, not a burst limit — so
+      // don't waste time waiting before falling through to the offline
+      // fallback chain. A 5xx, on the other hand, is often a brief Google
+      // server hiccup, so one short-wait retry is still worth it there.
+      if(resp.status !== 429){
+        sessionApiStats.retried++;
+        await new Promise(r => setTimeout(r, 1200));
+        resp = await doFetch();
+      }
     }
     return resp;
   });
@@ -1368,7 +1372,7 @@ async function handleTranslation(rawText, sender, isVoice){
       // once (to create the elements), then patch text directly for every
       // subsequent chunk — cheap enough to paint every frame.
       let streamStructureReady = false;
-      const streamResult = await geminiFetchStream('gemini-3.5-flash', {
+      const streamResult = await geminiFetchStream('gemini-3.6-flash', {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
           temperature: 0.4,
@@ -1504,7 +1508,7 @@ async function scanAndTranslate(file, side){
       + `ORIGINAL: <the text you read>\n`
       + `TRANSLATED: <the natural translation into ${targetLang.name}>`;
 
-    const resp = await geminiFetch('gemini-3.5-flash', {
+    const resp = await geminiFetch('gemini-3.6-flash', {
       contents: [{
         parts: [
           { text: prompt },
@@ -1858,7 +1862,7 @@ async function verifyBlock(msgId, text, fromSide, toSide, btnEl){
     const prompt = `Translate the following ${fromLang.name} text into ${toLang.name} as literally and accurately as possible `
       + `(this is for a back-translation accuracy check, not for natural conversation — precision matters more than fluency here). `
       + `Return ONLY the translation, nothing else.\n\nText: "${text}"`;
-    const resp = await geminiFetch('gemini-3.5-flash', {
+    const resp = await geminiFetch('gemini-3.6-flash', {
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0.2, maxOutputTokens: 1024, thinkingConfig: { thinkingLevel: 'minimal' } }
     });
@@ -2432,7 +2436,7 @@ async function qtTranslate(rawText, queryLabel){
         + `Message: "${rawText}"`;
 
       let qtStreamStructureReady = false;
-      const streamResult = await geminiFetchStream('gemini-3.5-flash', {
+      const streamResult = await geminiFetchStream('gemini-3.6-flash', {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: { temperature: 0.4, maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: 'minimal' } }
       }, (partialRaw) => {
@@ -2539,7 +2543,7 @@ async function qtHandleVoiceHold(blob){
       + `ORIGINAL: <exact transcription of what was said>\n`
       + `TRANSLATION: <the natural translation into ${targetLang.name}>`;
 
-    const streamResult = await geminiFetchStream('gemini-3.5-flash', {
+    const streamResult = await geminiFetchStream('gemini-3.6-flash', {
       contents: [{ parts: [
         { text: prompt },
         { inline_data: { mime_type: blob.type || 'audio/webm', data: base64 } }
@@ -2620,7 +2624,7 @@ async function qtScanAndTranslate(file){
       + `ORIGINAL: <the text you read>\n`
       + `TRANSLATION: <the natural translation into ${targetLang.name}>`;
 
-    const resp = await geminiFetch('gemini-3.5-flash', {
+    const resp = await geminiFetch('gemini-3.6-flash', {
       contents: [{ parts: [
         { text: prompt },
         { inline_data: { mime_type: file.type || 'image/jpeg', data: base64 } }
